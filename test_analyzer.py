@@ -22,7 +22,13 @@ from analyzer import (
     tr_lower,
     tr_upper,
 )
-from bot import is_group_chat, safe_filename
+from bot import (
+    is_allowed_chat,
+    is_group_chat,
+    parse_allowed_chat_ids,
+    safe_filename,
+)
+import bot as bot_module
 
 SAMPLE = Path(__file__).with_name("048c507c-32fc-4c7e-b7b6-17fc5d8915ad.xlsx")
 
@@ -257,6 +263,51 @@ class TestBotHelpers(unittest.TestCase):
         self.assertTrue(is_group_chat(group))
         self.assertTrue(is_group_chat(super_g))
         self.assertFalse(is_group_chat(none_chat))
+
+    def test_parse_allowed_chat_ids(self):
+        self.assertEqual(
+            parse_allowed_chat_ids("-1001234567890"),
+            frozenset({-1001234567890}),
+        )
+        self.assertEqual(
+            parse_allowed_chat_ids("-100111, -100222; -100333"),
+            frozenset({-100111, -100222, -100333}),
+        )
+        self.assertEqual(parse_allowed_chat_ids("", None, "  "), frozenset())
+        with self.assertRaises(ValueError):
+            parse_allowed_chat_ids("abc")
+
+    def test_allowed_chat_id_gate(self):
+        from types import SimpleNamespace
+        from telegram.constants import ChatType
+
+        original = bot_module.ALLOWED_CHAT_IDS
+        try:
+            bot_module.ALLOWED_CHAT_IDS = frozenset({-100999})
+
+            allowed = SimpleNamespace(
+                effective_chat=SimpleNamespace(
+                    type=ChatType.SUPERGROUP, id=-100999, title="OK"
+                )
+            )
+            other = SimpleNamespace(
+                effective_chat=SimpleNamespace(
+                    type=ChatType.SUPERGROUP, id=-100111, title="NO"
+                )
+            )
+            private = SimpleNamespace(
+                effective_chat=SimpleNamespace(
+                    type=ChatType.PRIVATE, id=12345, title=None
+                )
+            )
+            self.assertTrue(is_allowed_chat(allowed))
+            self.assertFalse(is_allowed_chat(other))
+            self.assertFalse(is_allowed_chat(private))
+
+            bot_module.ALLOWED_CHAT_IDS = frozenset()
+            self.assertFalse(is_allowed_chat(allowed))
+        finally:
+            bot_module.ALLOWED_CHAT_IDS = original
 
 
 @unittest.skipUnless(SAMPLE.exists(), "örnek Excel yok")

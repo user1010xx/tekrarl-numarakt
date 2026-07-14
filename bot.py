@@ -1,13 +1,14 @@
 """
 Telegram bot: Excel arama kayıtlarını personel bazlı tekrar analizi.
 
-Sadece grup / süpergruplarda çalışır. Özel sohbette sessiz kalır.
+Sadece ALLOWED_CHAT_IDS ile izin verilen grup(lar)da çalışır.
+Özel sohbet ve diğer gruplarda sessiz kalır.
 
 Kullanım:
-  1. .env dosyasına TELEGRAM_BOT_TOKEN yazın
+  1. .env / Railway: TELEGRAM_BOT_TOKEN + ALLOWED_CHAT_IDS
   2. pip install -r requirements.txt
   3. python bot.py
-  4. Botu gruba ekleyin; Group Privacy kapalı veya bot admin olsun
+  4. Botu izinli gruba ekleyin; Group Privacy kapalı veya bot admin olsun
 """
 
 from __future__ import annotations
@@ -46,14 +47,49 @@ logger = logging.getLogger("tekrar-bot")
 DEFAULT_MIN_REPEAT = int(os.getenv("MIN_REPEAT", "2"))
 MAX_FILE_MB = float(os.getenv("MAX_FILE_MB", "20"))
 
-# Yalnızca grup + süpergrup
+# Yalnızca grup + süpergrup (ek olarak chat id allowlist kontrolü var)
 GROUP_FILTER = filters.ChatType.GROUPS
+
+
+def parse_allowed_chat_ids(*raw_values: str | None) -> frozenset[int]:
+    """
+    ' -100123, -100456 ' veya tek id → frozenset[int].
+    Virgül / noktalı virgül / boşluk ayraçlarını kabul eder.
+    """
+    ids: set[int] = set()
+    for raw in raw_values:
+        if not raw:
+            continue
+        for part in re.split(r"[,;\s]+", str(raw).strip()):
+            if not part:
+                continue
+            try:
+                ids.add(int(part))
+            except ValueError as exc:
+                raise ValueError(
+                    f"Geçersiz chat id: {part!r}. "
+                    "Örnek: ALLOWED_CHAT_IDS=-1001234567890"
+                ) from exc
+    return frozenset(ids)
+
+
+def load_allowed_chat_ids_from_env() -> frozenset[int]:
+    """ALLOWED_CHAT_IDS ve/veya ALLOWED_CHAT_ID env değerlerini okur."""
+    return parse_allowed_chat_ids(
+        os.getenv("ALLOWED_CHAT_IDS"),
+        os.getenv("ALLOWED_CHAT_ID"),
+    )
+
+
+# Başlangıçta yüklenir; testler ALLOWED_CHAT_IDS'i yeniden atayabilir
+ALLOWED_CHAT_IDS: frozenset[int] = load_allowed_chat_ids_from_env()
 
 
 HELP_TEXT = """\
 Yardım — Komut Listesi
 
-Bu bot yalnızca gruplarda çalışır. Özel sohbette yanıt vermez.
+Bu bot yalnızca izin verilen grupta çalışır (ALLOWED_CHAT_IDS).
+Özel sohbet ve diğer gruplarda yanıt vermez.
 
 /start — Botu başlatır, kısa tanıtım ve kullanım bilgisini gösterir.
 
@@ -99,6 +135,29 @@ def is_group_chat(update: Update) -> bool:
     return chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
 
 
+def is_allowed_chat(update: Update) -> bool:
+    """
+    İzinli grup mu?
+    - Özel sohbet: hayır
+    - Grup ama chat id listede yok: hayır (sessiz; log yazar)
+    """
+    if not is_group_chat(update):
+        return False
+    chat = update.effective_chat
+    if not chat:
+        return False
+    if not ALLOWED_CHAT_IDS:
+        return False
+    if chat.id not in ALLOWED_CHAT_IDS:
+        logger.info(
+            "Yetkisiz grup yok sayıldı | chat_id=%s | title=%r",
+            chat.id,
+            getattr(chat, "title", None),
+        )
+        return False
+    return True
+
+
 def get_min_repeat(context: ContextTypes.DEFAULT_TYPE) -> int:
     """Grup bazlı eşik (chat_data)."""
     return int(context.chat_data.get("min_repeat", DEFAULT_MIN_REPEAT))
@@ -127,13 +186,14 @@ async def edit_plain(message, text: str) -> None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_group_chat(update) or not update.message:
+    if not is_allowed_chat(update) or not update.message:
         return
     min_r = get_min_repeat(context)
     await reply_plain(
         update.message,
         "Merhaba\n\n"
-        "Bu bot yalnızca bu grupta çalışır (özel sohbette yanıt vermez).\n\n"
+        "Bu bot yalnızca izin verilen bu grupta çalışır "
+        "(özel sohbet ve diğer gruplarda yanıt vermez).\n\n"
         "Arama Excel dosyanızı personel bazlı inceler:\n"
         "• Hangi personel\n"
         "• Hangi numarayı\n"
@@ -153,7 +213,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_group_chat(update) or not update.message:
+    if not is_allowed_chat(update) or not update.message:
         return
     min_r = get_min_repeat(context)
     text = HELP_TEXT + f"\nBu grubun mevcut eşiği: {min_r}"
@@ -161,7 +221,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_group_chat(update) or not update.message:
+    if not is_allowed_chat(update) or not update.message:
         return
     if not context.args:
         current = get_min_repeat(context)
@@ -186,12 +246,19 @@ async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def chat_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    İzinli grupta tam bilgi verir.
+    Yetkisiz grupta da sadece Chat ID döner (Railway'e yazmak için kurulum kolaylığı).
+    Özel sohbette sessiz.
+    """
     if not is_group_chat(update) or not update.message:
         return
     chat = update.effective_chat
     user = update.effective_user
     if not chat:
         return
+
+    allowed = bool(ALLOWED_CHAT_IDS and chat.id in ALLOWED_CHAT_IDS)
 
     lines = [
         "Chat ID Bilgisi",
@@ -201,19 +268,27 @@ async def chat_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     ]
     if chat.title:
         lines.append(f"Sohbet adı: {chat.title}")
-    if user:
+    if allowed and user:
         lines.append(f"User ID: {user.id}")
         if user.username:
             lines.append(f"Kullanıcı: @{user.username}")
         name = " ".join(p for p in [user.first_name, user.last_name] if p)
         if name:
             lines.append(f"İsim: {name}")
+    if allowed:
+        lines.append("Durum: bu grup izin listesinde (bot burada çalışır)")
+    else:
+        lines.append("Durum: bu grup henüz izinli değil")
+        lines.append(
+            "Railway / .env içine yazın:\n"
+            f"ALLOWED_CHAT_IDS={chat.id}"
+        )
 
     await reply_plain(update.message, "\n".join(lines))
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_group_chat(update) or not update.message:
+    if not is_allowed_chat(update) or not update.message:
         return
     doc: Document | None = update.message.document
     if not doc:
@@ -286,7 +361,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_non_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_group_chat(update) or not update.message:
+    if not is_allowed_chat(update) or not update.message:
         return
     if update.message.text and update.message.text.startswith("/"):
         return
@@ -312,12 +387,29 @@ async def post_init(app: Application) -> None:
 
 
 def main() -> None:
+    global ALLOWED_CHAT_IDS
+
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit(
             "TELEGRAM_BOT_TOKEN bulunamadı.\n"
-            "Proje dizininde .env dosyası oluşturun:\n"
+            "Railway Variables / .env:\n"
             "  TELEGRAM_BOT_TOKEN=123456:ABC-DEF...\n"
+        )
+
+    try:
+        ALLOWED_CHAT_IDS = load_allowed_chat_ids_from_env()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    if not ALLOWED_CHAT_IDS:
+        raise SystemExit(
+            "ALLOWED_CHAT_IDS zorunludur. Bot yalnızca izin verdiğiniz grupta çalışır.\n"
+            "Railway Variables / .env örneği:\n"
+            "  ALLOWED_CHAT_IDS=-1001234567890\n"
+            "Birden fazla grup: ALLOWED_CHAT_IDS=-100111,-100222\n"
+            "Chat ID öğrenmek: botu gruba ekleyip /chatid yazın "
+            "(bu komut kurulum için her grupta çalışır)."
         )
 
     app = (
@@ -329,6 +421,7 @@ def main() -> None:
     )
 
     # Özel sohbet: handler bağlanmaz → hiç yanıt yok
+    # Yetkisiz gruplar: is_allowed_chat içinde sessizce elenir (/chatid hariç)
     app.add_handler(CommandHandler("start", start, filters=GROUP_FILTER))
     app.add_handler(CommandHandler("help", help_cmd, filters=GROUP_FILTER))
     app.add_handler(CommandHandler("yardim", help_cmd, filters=GROUP_FILTER))
@@ -344,7 +437,11 @@ def main() -> None:
         )
     )
 
-    logger.info("Bot başlatılıyor (yalnızca gruplar, özel sohbet kapalı)…")
+    logger.info(
+        "Bot başlatılıyor | izinli chat_id sayısı=%s | ids=%s",
+        len(ALLOWED_CHAT_IDS),
+        sorted(ALLOWED_CHAT_IDS),
+    )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
