@@ -18,12 +18,13 @@ from typing import Any, BinaryIO, Iterable
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+import openpyxl.descriptors.base as _oxl_desc
 import openpyxl.utils.datetime as _oxl_dt
 import openpyxl.worksheet._reader as _oxl_reader
 
 # openpyxl tarih hücrelerini ISO sanır; "13.07.2026 00:00:00" gibi
 # TR/AB formatlarında ValueError fırlatır. String olarak bırakırız.
-# Not: worksheet._reader from_ISO8601'i import anında bağlar — orayı da yamalamak gerekir.
+# Not: alt modüller from_ISO8601'i import anında bağlar — hepsini yamalamak gerekir.
 _ORIG_FROM_ISO8601 = _oxl_dt.from_ISO8601
 
 
@@ -36,6 +37,7 @@ def _safe_from_ISO8601(formatted_string):
 
 _oxl_dt.from_ISO8601 = _safe_from_ISO8601
 _oxl_reader.from_ISO8601 = _safe_from_ISO8601
+_oxl_desc.from_ISO8601 = _safe_from_ISO8601
 
 # Sütun indeksleri (0-based): A, B, C, E, F, G
 COL_TELEFON = 0
