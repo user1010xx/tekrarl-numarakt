@@ -213,6 +213,69 @@ class TestAnalysisLogic(unittest.TestCase):
         self.assertIn("10:00:00", n.saatler[0])
         self.assertIn("11:00:00", n.saatler[1])
 
+    def test_openpyxl_tr_datetime_cell_type(self):
+        """
+        openpyxl tarih tipi hücrede TR format string olunca
+        'Invalid datetime value 13.07.2026 00:00:00' verirdi.
+        """
+        from openpyxl import Workbook
+        from openpyxl.utils.datetime import from_ISO8601
+        from analyzer import _safe_from_ISO8601
+
+        # Patch sonrası string dönmeli, exception atmamalı
+        val = from_ISO8601("13.07.2026 00:00:00")
+        self.assertEqual(val, "13.07.2026 00:00:00")
+        self.assertEqual(
+            _safe_from_ISO8601("13.07.2026 00:00:00"),
+            "13.07.2026 00:00:00",
+        )
+
+        wb = Workbook()
+        ws = wb.active
+        ws.append(
+            [
+                "TELEFON",
+                "ARAMA TARİHİ",
+                "ARAMA SAATİ",
+                "CallID",
+                "KONUŞMA",
+                "ÇALDIRMA",
+                "DAHİLİ ADI",
+            ]
+        )
+        # Hücre tipini tarih (d) yap, değer TR string — export dosyalarındaki senaryo
+        ws.append(
+            [
+                "905888888888",
+                "13.07.2026 00:00:00",
+                "10:00:00",
+                "x",
+                "00:00:01",
+                "00:00:01",
+                "zey  -O",
+            ]
+        )
+        ws.append(
+            [
+                "905888888888",
+                "13.07.2026 00:00:00",
+                "11:00:00",
+                "x",
+                "00:00:01",
+                "00:00:01",
+                "zey  -O",
+            ]
+        )
+        # openpyxl cell date type simulation via ISO path is enough with from_ISO8601 test;
+        # full workbook still must analyze
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        rep = analyze_workbook(buf, min_repeat=2)[0]
+        self.assertEqual(rep.personel, "Zey")
+        self.assertEqual(rep.tekrarli_numaralar[0].arama_sayisi, 2)
+        self.assertIn("13.07.2026", rep.tekrarli_numaralar[0].saatler[0])
+
     def test_report_workbook_structure(self):
         buf = _make_xlsx(
             [

@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable
@@ -18,6 +18,24 @@ from typing import Any, BinaryIO, Iterable
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+import openpyxl.utils.datetime as _oxl_dt
+import openpyxl.worksheet._reader as _oxl_reader
+
+# openpyxl tarih hücrelerini ISO sanır; "13.07.2026 00:00:00" gibi
+# TR/AB formatlarında ValueError fırlatır. String olarak bırakırız.
+# Not: worksheet._reader from_ISO8601'i import anında bağlar — orayı da yamalamak gerekir.
+_ORIG_FROM_ISO8601 = _oxl_dt.from_ISO8601
+
+
+def _safe_from_ISO8601(formatted_string):
+    try:
+        return _ORIG_FROM_ISO8601(formatted_string)
+    except (ValueError, TypeError):
+        return formatted_string
+
+
+_oxl_dt.from_ISO8601 = _safe_from_ISO8601
+_oxl_reader.from_ISO8601 = _safe_from_ISO8601
 
 # Sütun indeksleri (0-based): A, B, C, E, F, G
 COL_TELEFON = 0
@@ -168,19 +186,34 @@ def format_date(value: Any) -> str:
         return ""
     if isinstance(value, datetime):
         return value.strftime("%d.%m.%Y")
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Excel seri gün numarası
+        try:
+            from openpyxl.utils.datetime import from_excel
+
+            dt = from_excel(float(value))
+            if isinstance(dt, datetime):
+                return dt.strftime("%d.%m.%Y")
+            if isinstance(dt, date):
+                return dt.strftime("%d.%m.%Y")
+        except Exception:
+            pass
     text = str(value).strip()
     if not text or text.lower() in {"false", "none", "nan"}:
         return ""
-    # "13.07.2026 00:00:00" -> "13.07.2026"
-    m = re.match(r"^(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", text)
+    # "13.07.2026 00:00:00" / "13/07/2026" -> "13.07.2026"
+    m = re.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})", text)
     if m:
-        return m.group(1).replace("-", ".").replace("/", ".")
-    # ISO
+        d, mo, y = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+        if len(y) == 2:
+            y = "20" + y
+        return f"{d}.{mo}.{y}"
+    # ISO "2026-07-13..."
     m2 = re.match(r"^(\d{4})-(\d{2})-(\d{2})", text)
     if m2:
         return f"{m2.group(3)}.{m2.group(2)}.{m2.group(1)}"
-    if isinstance(value, datetime):
-        return value.strftime("%d.%m.%Y")
     return text[:10]
 
 
