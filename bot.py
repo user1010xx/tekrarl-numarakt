@@ -20,9 +20,9 @@ import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Document, Update
+from telegram import Document, InputFile, Update
 from telegram.constants import ChatAction, ChatType
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -296,12 +296,28 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     file_name = safe_filename(doc.file_name)
     lower = file_name.lower()
-    if not (lower.endswith(".xlsx") or lower.endswith(".xlsm")):
+    mime = (doc.mime_type or "").lower()
+    # Bazı istemciler uzantıyı düşürür / mime ile gönderir
+    looks_excel = (
+        lower.endswith(".xlsx")
+        or lower.endswith(".xlsm")
+        or "spreadsheet" in mime
+        or "excel" in mime
+        or mime
+        in {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+            "application/octet-stream",
+        }
+    )
+    if not looks_excel and not lower.endswith((".xlsx", ".xlsm")):
         await reply_plain(
             update.message,
             "Lütfen .xlsx formatında Excel gönderin (eski .xls desteklenmez).",
         )
         return
+    if not lower.endswith((".xlsx", ".xlsm")):
+        file_name = safe_filename((doc.file_name or "dosya") + ".xlsx")
 
     if doc.file_size and doc.file_size > MAX_FILE_MB * 1024 * 1024:
         await reply_plain(
@@ -322,41 +338,62 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             action=ChatAction.TYPING,
         )
         tg_file = await doc.get_file()
+        # download_to_drive bazı ortamlarda path sorunlu; byte olarak al
+        raw = bytes(await tg_file.download_as_bytearray())
+        if len(raw) < 64:
+            raise ValueError(f"İndirilen dosya çok küçük ({len(raw)} bayt).")
+        # xlsx = zip (PK\x03\x04)
+        if not (raw[:2] == b"PK" or raw[:4] == b"\xd0\xcf\x11\xe0"):
+            raise ValueError(
+                "Dosya geçerli bir Excel (.xlsx) gibi görünmüyor "
+                f"(başlangıç: {raw[:8]!r}). Yeniden .xlsx olarak kaydedip gönderin."
+            )
+        if raw[:4] == b"\xd0\xcf\x11\xe0":
+            raise ValueError(
+                "Eski .xls formatı tespit edildi. Lütfen .xlsx olarak kaydedin."
+            )
 
         with tempfile.TemporaryDirectory(prefix="tekrar_bot_") as tmp:
             src_path = Path(tmp) / file_name
-            await tg_file.download_to_drive(custom_path=str(src_path))
+            src_path.write_bytes(raw)
 
             reports = analyze_workbook(src_path, min_repeat=min_repeat)
             summary = format_text_summary(reports)
             report_buf = build_report_workbook(reports, min_repeat=min_repeat)
 
-            out_name = f"tekrar_rapor_{Path(file_name).stem[:80]}.xlsx"
-            out_name = safe_filename(out_name)
-            out_path = Path(tmp) / out_name
-            out_path.write_bytes(report_buf.getvalue())
+            out_name = safe_filename(
+                f"tekrar_rapor_{Path(file_name).stem[:80]}.xlsx"
+            )
 
-            await edit_plain(status, summary)
+            # Özet mesajı (edit başarısızsa yeni mesaj)
+            try:
+                await status.edit_text(summary)
+            except BadRequest:
+                logger.warning("Özet edit başarısız, yeni mesaj gönderiliyor")
+                await update.message.reply_text(summary)
 
             await context.bot.send_chat_action(
                 chat_id=update.effective_chat.id,
                 action=ChatAction.UPLOAD_DOCUMENT,
             )
-            with out_path.open("rb") as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=out_name,
-                    caption=(
-                        "Detaylı personel bazlı rapor\n"
-                        "Sayfalar: Bilgi | Ozet | TekrarliAramalar | personel adları"
-                    ),
-                )
-    except Exception:
+            report_buf.seek(0)
+            await update.message.reply_document(
+                document=InputFile(report_buf, filename=out_name),
+                caption=(
+                    "Detaylı personel bazlı rapor\n"
+                    "Sayfalar: Bilgi | Ozet | TekrarliAramalar | personel adları"
+                ),
+            )
+    except Exception as exc:
         logger.exception("Analiz hatası")
+        err = f"{type(exc).__name__}: {exc}"
+        if len(err) > 350:
+            err = err[:347] + "..."
         await edit_plain(
             status,
-            "Dosya işlenirken hata oluştu.\n"
-            "Sütunların A/B/C/E/F/G düzeninde ve .xlsx olduğundan emin olun.",
+            "Dosya işlenirken hata oluştu.\n\n"
+            f"Detay: {err}\n\n"
+            "Kontrol: .xlsx formatı, A/B/C/E/F/G sütunları.",
         )
 
 
